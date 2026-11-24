@@ -1,0 +1,149 @@
+
+---
+- name: HELIOS Automated Local Deployment
+  hosts: helios
+  gather_facts: false
+
+  vars:
+    app_image: helios-app:v3
+    app_container: helios-managed
+    app_network: helios-network
+    app_port: 5002
+
+  tasks:
+    - name: Verify Docker Engine
+      ansible.builtin.command: docker info
+      changed_when: false
+
+    - name: Verify HELIOS Docker network
+      ansible.builtin.command:
+        cmd: "docker network inspect {{ app_network }}"
+      changed_when: false
+
+    - name: Verify target application image
+      ansible.builtin.command:
+        cmd: "docker image inspect {{ app_image }}"
+      register: target_image
+      changed_when: false
+
+    - name: Check existing managed container
+      ansible.builtin.command:
+        cmd: "docker container inspect {{ app_container }}"
+      register: container_check
+      failed_when: container_check.rc not in [0, 1]
+      changed_when: false
+
+    - name: Initialize previous deployment information
+      ansible.builtin.set_fact:
+        previous_image: ""
+        previous_image_id: ""
+        previous_running: false
+
+    - name: Record previous deployment information
+      ansible.builtin.set_fact:
+        previous_image: "{{ (container_check.stdout | from_json)[0].Config.Image }}"
+        previous_image_id: "{{ (container_check.stdout | from_json)[0].Image }}"
+        previous_running: "{{ (container_check.stdout | from_json)[0].State.Running }}"
+      when: container_check.rc == 0
+
+    - name: Determine whether deployment is required
+      ansible.builtin.set_fact:
+        deployment_required: "{{ container_check.rc == 1 or previous_image_id != (target_image.stdout | from_json)[0].Id or previous_image != app_image }}"
+
+    - name: Display deployment versions
+      ansible.builtin.debug:
+        msg:
+          - "Current image: {{ previous_image }}"
+          - "Target image: {{ app_image }}"
+          - "Deployment required: {{ deployment_required }}"
+
+    - name: Automated application deployment
+      block:
+        - name: Remove existing managed container
+          ansible.builtin.command:
+            cmd: "docker rm -f {{ app_container }}"
+          when:
+            - container_check.rc == 0
+            - deployment_required | bool
+
+        - name: Deploy target HELIOS image
+          ansible.builtin.command:
+            cmd: >
+              docker run -d
+              --name {{ app_container }}
+              --network {{ app_network }}
+              -p 127.0.0.1:{{ app_port }}:5000
+              --restart unless-stopped
+              -e APP_ENV=production
+              {{ app_image }}
+          when: deployment_required | bool
+
+        - name: Ensure existing container is running
+          ansible.builtin.command:
+            cmd: "docker start {{ app_container }}"
+          when:
+            - not (deployment_required | bool)
+            - not (previous_running | bool)
+
+        - name: Verify application health
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ app_port }}/health"
+            status_code: 200
+            return_content: true
+          register: health_check
+          until:
+            - health_check.status | default(0) == 200
+            - (health_check.json | default({})).status | default('') == 'healthy'
+          retries: 10
+          delay: 3
+
+      rescue:
+        - name: Display deployment failure
+          ansible.builtin.debug:
+            msg: "Deployment failed. Starting recovery."
+
+        - name: Remove failed deployment
+          ansible.builtin.command:
+            cmd: "docker rm -f {{ app_container }}"
+          register: cleanup_result
+          failed_when:
+            - cleanup_result.rc != 0
+            - "'No such container' not in cleanup_result.stderr"
+          when: deployment_required | bool
+
+        - name: Restore previous application image
+          ansible.builtin.command:
+            cmd: >
+              docker run -d
+              --name {{ app_container }}
+              --network {{ app_network }}
+              -p 127.0.0.1:{{ app_port }}:5000
+              --restart unless-stopped
+              -e APP_ENV=production
+              {{ previous_image_id }}
+          when:
+            - deployment_required | bool
+            - previous_image_id | length > 0
+
+        - name: Verify rollback health
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ app_port }}/health"
+            status_code: 200
+            return_content: true
+          register: rollback_health
+          until:
+            - rollback_health.status | default(0) == 200
+            - (rollback_health.json | default({})).status | default('') == 'healthy'
+          retries: 10
+          delay: 3
+          when:
+            - deployment_required | bool
+            - previous_image_id | length > 0
+
+        - name: Report unsuccessful deployment
+          ansible.builtin.fail:
+            msg: "Target deployment failed. Review recovery task results."
+
+    - name: Display deployment result
+      ansible.builtin.debug:
+        msg: "HELIOS deployment completed successfully!"

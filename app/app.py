@@ -1,9 +1,54 @@
-from flask import Flask, jsonify
+
+from flask import Flask, jsonify, request, g
+from prometheus_client import (
+    Counter,
+    Histogram,
+    generate_latest,
+    CONTENT_TYPE_LATEST
+)
 import os
 import platform
+import time
 from datetime import datetime, timezone
 
 app = Flask(__name__)
+
+# Prometheus metrics
+REQUEST_COUNT = Counter(
+    "helios_http_requests_total",
+    "Total HTTP requests received by HELIOS",
+    ["method", "endpoint", "status"]
+)
+
+REQUEST_DURATION = Histogram(
+    "helios_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "endpoint"]
+)
+
+
+@app.before_request
+def start_timer():
+    g.start_time = time.perf_counter()
+
+
+@app.after_request
+def record_metrics(response):
+    if request.path != "/metrics":
+        endpoint = request.url_rule.rule if request.url_rule else "unknown"
+
+        REQUEST_COUNT.labels(
+            method=request.method,
+            endpoint=endpoint,
+            status=str(response.status_code)
+        ).inc()
+
+        REQUEST_DURATION.labels(
+            method=request.method,
+            endpoint=endpoint
+        ).observe(time.perf_counter() - g.start_time)
+
+    return response
 
 
 @app.route("/")
@@ -43,6 +88,13 @@ def system_info():
         "os_release": platform.release(),
         "python_version": platform.python_version()
     }), 200
+
+
+@app.route("/metrics")
+def metrics():
+    return generate_latest(), 200, {
+        "Content-Type": CONTENT_TYPE_LATEST
+    }
 
 
 if __name__ == "__main__":
